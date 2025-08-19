@@ -1,14 +1,9 @@
 import * as vscode from 'vscode'
 import WebSocket from 'ws'
 import { createClient } from '@deepgram/sdk'
-// import { AgentPanel } from './agent-panel'
-// Remove these direct imports
-// import Microphone from 'node-microphone'
-// import Speaker from 'speaker'
-// Import our wrappers instead
+// Wrappers & local services
 import { MicrophoneWrapper } from '../utils/native-module-wrapper'
 import { PromptManagementService } from './prompt-management-service'
-import { env, window, workspace } from 'vscode'
 import { LLMService } from './llm-service'
 import { EventEmitter } from 'events'
 import { CommandRegistryService } from './command-registry-service'
@@ -17,110 +12,126 @@ import { ConversationLoggerService } from './conversation-logger-service'
 import { SpecGeneratorService } from './spec-generator-service'
 import { checkNativeModulesCompatibility } from '../utils/binary-loader'
 
+/**
+ * ------------------------------
+ * Types for Deepgram Agent V1
+ * ------------------------------
+ */
 interface AgentConfig {
-  type: 'SettingsConfiguration'
+  type: 'Settings'
   audio: {
-    input: {
-      encoding: string
-      sample_rate: number
-    }
-    output: {
-      encoding: string
-      sample_rate: number
-      container: string
-    }
+    input: { encoding: string; sample_rate: number }
+    output: { encoding: string; sample_rate: number; container: 'none' | 'wav' }
   }
   agent: {
-    listen: {     
-      model: string
-    }
+    language?: string
+    greeting?: string
+    listen: { provider: { type: string; model: string } }
     think: {
-      provider: {
-        type: string
-      }
-      model: string
-      instructions: string
+      provider: { type: string; model: string }
+      prompt: string
       functions: Array<{
         name: string
         description: string
         parameters: {
           type: 'object'
           properties: {
-            name?: {
-              type: string
-              description: string
-            }
-            args?: {
-              type: 'array'
-              description: string
-              items: {
-                type: string
-              }
-            }
-            format?: {
-              type: string
-              enum?: string[]
-              description: string
-            }
+            name?: { type: string; description: string }
+            args?: { type: 'array'; description: string; items: { type: string } }
+            format?: { type: string; enum?: string[]; description: string }
+            filePath?: { type: string; description: string }
+            startLine?: { type: string; description: string }
+            endLine?: { type: string; description: string }
           }
           required: string[]
         }
       }>
     }
-    speak: {
-      model: string
-      temp?: number
-      rep_penalty?: number
-    }
+    speak: { provider: { type: string; model: string } }
   }
 }
 
-interface AgentMessage {
-  type: 
-    | 'Welcome' 
-    | 'Ready'
-    | 'Speech'
-    | 'AgentResponse'
-    | 'FunctionCallRequest'
-    | 'FunctionCalling'
-    | 'ConversationText'
-    | 'UserStartedSpeaking'
-    | 'AgentStartedSpeaking'
-    | 'AgentAudioDone'
-    | 'Error'
-    | 'Close'
-    | 'SettingsApplied'
-  session_id?: string
+// Server -> client JSON messages
+interface AgentMessageBase { type: string }
+interface WelcomeMessage extends AgentMessageBase { type: 'Welcome' }
+interface SettingsAppliedMessage extends AgentMessageBase { type: 'SettingsApplied' }
+interface ReadyMessage extends AgentMessageBase { type: 'Ready' }
+interface SpeechMessage extends AgentMessageBase { type: 'Speech'; text?: string; is_final?: boolean }
+interface AgentResponseMessage extends AgentMessageBase {
+  type: 'AgentResponse'
   text?: string
-  is_final?: boolean
-  role?: 'assistant' | 'user'
-  content?: string
-  audio?: {
-    data: string
-    encoding: string
-    sample_rate: number
-    container?: string
-    bitrate?: number
-  }
-  message?: string
-  function_name?: string
-  function_call_id?: string
-  input?: any
+  audio?: { data: string; encoding: string; sample_rate: number; container?: string; bitrate?: number }
   tts_latency?: number
   ttt_latency?: number
   total_latency?: number
 }
+interface ConversationTextMessage extends AgentMessageBase {
+  type: 'ConversationText'
+  role?: 'assistant' | 'user'
+  content?: string
+}
+interface FunctionCallRequestMessage extends AgentMessageBase {
+  type: 'FunctionCallRequest'
+  functions?: Array<{ id: string; name: string; arguments: string; client_side: boolean }>
+}
+interface AgentThinkingMessage extends AgentMessageBase { type: 'AgentThinking'; content?: string }
+interface PromptUpdatedMessage extends AgentMessageBase { type: 'PromptUpdated' }
+interface SpeakUpdatedMessage extends AgentMessageBase { type: 'SpeakUpdated' }
+interface UserStartedSpeakingMessage extends AgentMessageBase { type: 'UserStartedSpeaking' }
+interface AgentStartedSpeakingMessage extends AgentMessageBase { type: 'AgentStartedSpeaking' }
+interface AgentAudioDoneMessage extends AgentMessageBase { type: 'AgentAudioDone' }
+interface WarningMessage extends AgentMessageBase { type: 'Warning'; description?: string }
+interface ErrorMessage extends AgentMessageBase { type: 'Error'; description?: string; message?: string; code?: string }
+interface CloseMessage extends AgentMessageBase { type: 'Close' }
+
+type AgentMessage =
+  | WelcomeMessage
+  | SettingsAppliedMessage
+  | ReadyMessage
+  | SpeechMessage
+  | AgentResponseMessage
+  | FunctionCallRequestMessage
+  | ConversationTextMessage
+  | UserStartedSpeakingMessage
+  | AgentStartedSpeakingMessage
+  | AgentAudioDoneMessage
+  | AgentThinkingMessage
+  | PromptUpdatedMessage
+  | SpeakUpdatedMessage
+  | WarningMessage
+  | ErrorMessage
+  | CloseMessage
 
 export interface MessageHandler {
   postMessage(message: unknown): Thenable<boolean>
 }
 
+/**
+ * ----------------------------------
+ * VoiceAgentService — full rewrite
+ * ----------------------------------
+ * Key fixes vs. original:
+ *  - Properly distinguishes JSON vs. binary frames (no JSON.parse on audio)
+ *  - Avoids dumping base64 audio into transcript
+ *  - Centralizes KeepAlive (JSON + ws ping)
+ *  - Safer microphone lifecycle and cleanup
+ *  - Clear logging & event emission
+ */
 export class VoiceAgentService {
+  // Connection
   private ws: WebSocket | null = null
-  private isInitialized = false
   private keepAliveInterval: NodeJS.Timeout | null = null
-  private audioBuffers: Buffer[] = []
-  private readonly AGENT_SAMPLE_RATE = 24000
+  private jsonKeepAliveInterval: NodeJS.Timeout | null = null
+  private isInitialized = false
+
+  // Audio / IO
+  private readonly INPUT_SAMPLE_RATE = 16000 // mic capture
+  private readonly OUTPUT_SAMPLE_RATE = 24000 // agent output
+  private readonly OUTPUT_ENCODING = 'linear16' as const
+  private currentMic: MicrophoneWrapper | null = null
+  private isProcessingRequest = false // Tracks if "Working on that…" has been sent for current request
+
+  // Services
   private promptManager: PromptManagementService
   private llmService: LLMService
   private eventEmitter = new EventEmitter()
@@ -129,6 +140,8 @@ export class VoiceAgentService {
   private agentPanel: MessageHandler | undefined = undefined
   private conversationLogger: ConversationLoggerService
   private specGenerator: SpecGeneratorService
+
+  // VS Code wiring
   private context: vscode.ExtensionContext
   private updateStatus: (status: string) => void
   private updateTranscript: (text: string) => void
@@ -137,7 +150,7 @@ export class VoiceAgentService {
     context,
     updateStatus,
     updateTranscript,
-    conversationLogger
+    conversationLogger,
   }: {
     context: vscode.ExtensionContext
     updateStatus: (status: string) => void
@@ -149,20 +162,14 @@ export class VoiceAgentService {
     this.updateTranscript = updateTranscript
     this.conversationLogger = conversationLogger
 
-    // Assign llmService first
+    // Service init order matters here
     this.llmService = new LLMService(context)
-
-    // Then create specGenerator
     this.specGenerator = new SpecGeneratorService(this.llmService, this.conversationLogger)
-
     this.promptManager = new PromptManagementService(context)
     this.commandRegistry = new CommandRegistryService()
     this.workspaceService = new WorkspaceService()
 
-    // Comment out or remove agentPanel if unused
-    // this.agentPanel = agentPanel
-
-    // Use the public method to register the command
+    // Register sample function-callable command
     this.commandRegistry.registerCommand({
       name: 'generateProjectSpec',
       command: 'vibe-coder.generateProjectSpec',
@@ -171,48 +178,53 @@ export class VoiceAgentService {
       parameters: {
         type: 'object',
         properties: {
-          format: {
-            type: 'string',
-            enum: ['markdown'],
-            description: 'Output format (currently only supports markdown)'
-          }
+          format: { type: 'string', enum: ['markdown'], description: 'Output format' },
         },
-        required: ['format']
-      }
+        required: ['format'],
+      },
     })
+
+    vscode.window.onDidChangeActiveTextEditor(async () => {
+      if (this.ws && this.ws.readyState === WebSocket.OPEN) {
+        const prompt = await this.getAgentPrompt();
+        this.updatePrompt(prompt);
+      }
+    });
   }
 
   async initialize(): Promise<void> {
-    // Check if native modules are available for this platform
-    const compatibility = checkNativeModulesCompatibility()
+    const compatibility = checkNativeModulesCompatibility();
     if (!compatibility.compatible) {
-      vscode.window.showWarningMessage(compatibility.message)
-      console.warn('Native module compatibility check failed:', compatibility)
+      vscode.window.showWarningMessage(compatibility.message);
+      console.warn('Native module compatibility check failed:', compatibility);
     }
-
-    // Check for API key but don't require it for initialization
-    const apiKey = await this.context.secrets.get('deepgram.apiKey')
-    // We'll mark as initialized even without an API key
-    this.isInitialized = true
+    // Catch unhandled promise rejections
+    process.on('unhandledRejection', (reason, promise) => {
+      const errMsg = `Unhandled promise rejection: ${reason}`;
+      console.error(errMsg);
+      this.updateTranscript(errMsg);
+      this.conversationLogger.logEntry({ role: 'user', content: errMsg });
+    });
+    // We don’t require API key at init; we’ll prompt on connect if missing
+    this.isInitialized = true;
   }
 
+  /** Connects to Deepgram Agent V1 and wires up event handlers */
   async startAgent(): Promise<void> {
-    if (!this.isInitialized) 
-      throw new Error('Voice Agent not initialized')
+    if (!this.isInitialized) throw new Error('Voice Agent not initialized')
 
-    // Ensure cleanup of any existing connection first
-    this.cleanup()
+    this.cleanup() // ensure clean slate
 
     try {
       this.updateStatus('Connecting to agent...')
 
-      const apiKey = await this.context.secrets.get('deepgram.apiKey')
+      let apiKey = await this.context.secrets.get('deepgram.apiKey')
       if (!apiKey) {
         const key = await vscode.window.showInputBox({
           prompt: 'Enter your Deepgram API key',
           password: true,
           placeHolder: 'Deepgram API key is required for voice agent',
-          ignoreFocusOut: true
+          ignoreFocusOut: true,
         })
         if (!key) {
           this.updateStatus('API key required')
@@ -220,435 +232,356 @@ export class VoiceAgentService {
           throw new Error('Deepgram API key is required')
         }
         await this.context.secrets.store('deepgram.apiKey', key)
+        apiKey = key
       }
 
-      this.ws = new WebSocket('wss://agent.deepgram.com/agent', 
-        ['token'],
-        {
-          headers: {
-            'Authorization': `Token ${apiKey || ''}`
-          }
-        }
-      )
+      // Connect to V1 Agent WS endpoint
+      this.ws = new WebSocket('wss://agent.deepgram.com/v1/agent/converse', ['token'], {
+        headers: { Authorization: `Token ${apiKey}` },
+      })
 
-      // Wait for connection to be established
       await new Promise<void>((resolve, reject) => {
         if (!this.ws) return reject(new Error('WebSocket not initialized'))
-        
-        this.ws.on('open', () => {
-          console.log('WebSocket connection opened')
-          resolve()
-        })
-        
-        this.ws.on('error', (error) => {
-          console.error('WebSocket connection error:', error)
-          reject(error)
-        })
+        this.ws.once('open', () => resolve())
+        this.ws.once('error', (err) => reject(err))
       })
 
-      // Set up message handler after connection is established
-      this.ws.on('message', async (data: WebSocket.Data) => {
+      // ---- Message handling (binary vs JSON) ----
+      this.ws.on('message', async (data: WebSocket.Data, isBinary?: boolean) => {
         try {
-          const message = JSON.parse(data.toString()) as AgentMessage
-          console.log('WebSocket received message:', message)
-
-          switch (message.type) {
-            case 'Welcome':
-              console.log('Received Welcome, sending configuration...')
-              const config = await this.getAgentConfig()
-              console.log('Sending configuration:', JSON.stringify(config, null, 2))
-              this.ws?.send(JSON.stringify(config))
-              this.updateStatus('Configuring agent...')
-              break
-
-            case 'SettingsApplied':
-              console.log('Settings applied, setting up microphone...')
-              this.setupMicrophone()
-              this.updateStatus('Connected! Start speaking...')
-              break
-
-            case 'Ready':
-              console.log('Agent ready to receive audio')
-              this.updateStatus('Ready! Start speaking...')
-              break
-            case 'Speech':
-              this.updateTranscript(message.text || '')
-              break
-            case 'AgentResponse':
-              console.log('Agent response received:', message)
-              if (message.text) {
-                console.log('Logging agent response from WebSocket')
-                this.conversationLogger.logEntry({
-                  role: 'assistant',
-                  content: message.text
-                })
-              }
-              this.updateTranscript(message.text || '')
-              if (message.audio) {
-                this.playAudioResponse(message.audio)
-              }
-              break
-            case 'FunctionCallRequest':
-              console.log('Function call requested:', message)
-              try {
-                const result = await this.handleFunctionCall(
-                  message.function_call_id!,
-                  {
-                    name: message.function_name,
-                    arguments: JSON.stringify(message.input)
-                  }
-                )
-
-                const response = {
-                  type: 'FunctionCallResponse',
-                  function_call_id: message.function_call_id,
-                  output: JSON.stringify(result)
-                }
-                console.log('Sending function call response:', response)
-                this.ws?.send(JSON.stringify(response))
-              } catch (error) {
-                console.error('Function call failed:', error)
-                const errorResponse = {
-                  type: 'FunctionCallResponse',
-                  function_call_id: message.function_call_id,
-                  output: JSON.stringify({
-                    success: false,
-                    error: (error as Error).message
-                  })
-                }
-                this.ws?.send(JSON.stringify(errorResponse))
-              }
-              break
-            case 'FunctionCalling':
-              // Debug message from server about function calling workflow
-              console.log('Function calling debug:', message)
-              break
-            case 'ConversationText':
-              console.log('Conversation text received:', message)
-              if (message.role && message.content) {
-                console.log('Logging conversation entry from WebSocket')
-                this.conversationLogger.logEntry({
-                  role: message.role,
-                  content: message.content
-                })
-              }
-              if (message.role === 'assistant') {
-                this.agentPanel?.postMessage({
-                  type: 'updateTranscript',
-                  text: message.content || '',
-                  target: 'agent-transcript',
-                  animate: true
-                })
-              }
-              this.eventEmitter.emit('transcript', message.content || '')
-              break
-            case 'UserStartedSpeaking':
-              console.log('User started speaking, stopping audio playback')
-              
-              // Send a message to the webview to stop all audio playback
-              if (this.agentPanel) {
-                this.agentPanel.postMessage({
-                  type: 'stopAudio'
-                });
-              }
-              
-              this.sendSpeakingStateUpdate('idle')
-              break
-            case 'AgentStartedSpeaking':
-              console.log('Agent started speaking')
-              this.sendSpeakingStateUpdate('speaking')
-              break
-            case 'AgentAudioDone':
-              console.log('Agent audio done')
-              this.sendSpeakingStateUpdate('idle')
-              break
-            case 'Error':
-              console.error('Agent error:', message)
-              vscode.window.showErrorMessage(`Agent error: ${message.message}`)
-              this.updateStatus('Error occurred')
-              break
-            case 'Close':
-              console.log('Agent requested close')
-              this.cleanup()
-              break
-            default:
-              console.log('Unknown message type:', message.type)
+          const binary = typeof isBinary === 'boolean' ? isBinary : this.isBinaryFrame(data)
+          if (binary) {
+            this.handleRawAudio(this.toBuffer(data))
+            return
           }
-        } catch (e) {
-          console.error('Error handling WebSocket message:', e)
-          // If it's not JSON, it's raw audio data
-          if (data instanceof Buffer) {
-            this.handleRawAudio(data)
-          }
+
+          const text = typeof data === 'string' ? data : this.toBuffer(data).toString('utf8')
+          const message = JSON.parse(text) as AgentMessage
+          await this.routeJsonMessage(message)
+        } catch (err) {
+          // Only warn for unexpected non-JSON text frames; binary is handled above
+          console.warn('Ignoring non-JSON text frame:', (err as Error).message)
         }
       })
 
-      // Set up keep-alive interval
+      // Keep-alives: TCP/WebSocket ping and Agent-level KeepAlive JSON
       this.keepAliveInterval = setInterval(() => {
-        if (this.ws?.readyState === WebSocket.OPEN) {
-          this.ws.ping()
-        }
-      }, 30000)
+        if (this.ws && this.ws.readyState === WebSocket.OPEN) this.ws.ping()
+      }, 30_000)
 
+      this.jsonKeepAliveInterval = setInterval(() => {
+        if (this.ws && this.ws.readyState === WebSocket.OPEN) {
+          this.ws.send(JSON.stringify({ type: 'KeepAlive' }))
+        }
+      }, 25_000)
+
+      this.updateStatus('Connected, awaiting Welcome...')
     } catch (error) {
       console.error('Failed to start agent:', error)
-      this.cleanup() // Cleanup on error
+      this.cleanup()
       throw error
     }
   }
 
+  /** Properly routes parsed JSON messages */
+  private async routeJsonMessage(message: AgentMessage): Promise<void> {
+    switch (message.type) {
+      case 'Welcome': {
+        this.updateStatus('Sending configuration...')
+        const config = await this.getAgentConfig()
+        this.ws?.send(JSON.stringify(config))
+        break
+      }
+      case 'SettingsApplied': {
+        this.updateStatus('Settings applied, starting microphone...')
+        this.setupMicrophone()
+        break
+      }
+      case 'Ready': {
+        this.updateStatus('Ready! Start speaking...')
+        break
+      }
+      case 'Speech': {
+        const s = (message as SpeechMessage).text || ''
+        if (s) this.updateTranscript(s)
+        break
+      }
+      case 'AgentResponse': {
+        const m = message as AgentResponseMessage
+        if (m.text) {
+          this.conversationLogger.logEntry({ role: 'assistant', content: m.text })
+          this.updateTranscript(m.text)
+          this.isProcessingRequest = false; // Reset after agent responds
+        }
+        // Some servers include base64 audio in JSON; still support it.
+        if (m.audio && this.agentPanel) {
+          this.agentPanel.postMessage({
+            type: 'playAudio',
+            audio: { data: m.audio.data, encoding: m.audio.encoding, sampleRate: m.audio.sample_rate },
+          })
+          this.sendSpeakingStateUpdate('speaking')
+        }
+        break
+      }
+      case 'FunctionCallRequest': {
+        const fmsg = message as FunctionCallRequestMessage
+        const funcs = fmsg.functions || []
+        for (const func of funcs) {
+          if (!func.client_side) continue
+          try {
+            const result = await this.handleFunctionCall(func.id, { name: func.name, arguments: func.arguments })
+            const response = { type: 'FunctionCallResponse', id: func.id, name: func.name, content: JSON.stringify(result) }
+            this.ws?.send(JSON.stringify(response))
+          } catch (e) {
+            const errRes = {
+              type: 'FunctionCallResponse',
+              id: func.id,
+              name: func.name,
+              content: JSON.stringify({ success: false, error: (e as Error).message }),
+            }
+            this.ws?.send(JSON.stringify(errRes))
+          }
+        }
+        break
+      }
+      case 'ConversationText': {
+        const c = message as ConversationTextMessage
+        if (c.role && c.content) {
+          this.conversationLogger.logEntry({ role: c.role, content: c.content })
+          if (c.role === 'assistant') {
+            this.agentPanel?.postMessage({
+              type: 'updateTranscript',
+              text: c.content,
+              target: 'agent-transcript',
+              animate: true,
+            })
+          }
+          this.eventEmitter.emit('transcript', c.content)
+        }
+        break
+      }
+      case 'UserStartedSpeaking': {
+        // Stop any active playback in the webview
+        this.agentPanel?.postMessage({ type: 'stopAudio' })
+        this.sendSpeakingStateUpdate('idle')
+        this.isProcessingRequest = false; // Reset for new user request
+        break
+      }
+      case 'AgentStartedSpeaking': {
+        this.sendSpeakingStateUpdate('speaking')
+        break
+      }
+      case 'AgentAudioDone': {
+        this.sendSpeakingStateUpdate('idle')
+        break
+      }
+      case 'AgentThinking': {
+        this.updateStatus('Agent thinking...')
+        break
+      }
+      case 'PromptUpdated':
+      case 'SpeakUpdated': {
+        // Informational
+        break
+      }
+      case 'Warning': {
+        const w = message as WarningMessage
+        vscode.window.showWarningMessage(`Agent warning: ${w.description ?? 'Unknown warning'}`)
+        break
+      }
+      case 'Error': {
+        const e = message as ErrorMessage
+        vscode.window.showErrorMessage(`Agent error: ${e.description || e.message || 'Unknown error'}`)
+        this.updateStatus('Error occurred')
+        break
+      }
+      case 'Close': {
+        this.cleanup()
+        break
+      }
+      default: {
+        console.log('Unknown message type:', (message as any)?.type)
+      }
+    }
+  }
+
+  /** Microphone -> stream PCM16 to WS */
   private setupMicrophone() {
-    // Use our wrapper instead of direct microphone
+    // Ensure previous mic is stopped
+    if (this.currentMic) {
+      try { this.currentMic.stopRecording() } catch {}
+      this.currentMic = null
+    }
+
     const mic = new MicrophoneWrapper()
+    this.currentMic = mic
+
     try {
       const audioStream = mic.startRecording()
 
       audioStream.on('data', (chunk: Buffer) => {
-        if (this.ws?.readyState === WebSocket.OPEN) {
-          this.ws.send(chunk)
-        }
+        if (this.ws?.readyState === WebSocket.OPEN) this.ws.send(chunk)
       })
-
       audioStream.on('error', (error: Error) => {
         vscode.window.showErrorMessage(`Microphone error: ${error.message}`)
         this.cleanup()
       })
+      this.updateStatus('Mic streaming… speak anytime')
     } catch (error) {
       vscode.window.showErrorMessage(`Failed to start microphone: ${error instanceof Error ? error.message : String(error)}`)
       this.cleanup()
     }
   }
 
-  private async playAudioResponse(audio: { data: string, encoding: string, sample_rate: number }) {
-    // Instead of playing audio through the native speaker, send it to the webview
-    if (!this.agentPanel) {
-      console.warn('No agent panel available for audio playback')
-      return
-    }
-
-    console.log('Sending audio data to webview for playback')
-    
-    // Send the audio data to the webview
+  /** Binary audio from server (raw linear16 or WAV) */
+  private handleRawAudio(data: Buffer) {
+    if (!this.agentPanel) return
+    const base64Audio = data.toString('base64')
     this.agentPanel.postMessage({
       type: 'playAudio',
-      audio: {
-        data: audio.data,
-        encoding: audio.encoding,
-        sampleRate: audio.sample_rate
-      }
+      audio: { data: base64Audio, encoding: this.OUTPUT_ENCODING, sampleRate: this.OUTPUT_SAMPLE_RATE, isRaw: true },
     })
-    
-    // Also update the transcript if available
-    this.updateTranscript(audio.data)
+    this.sendSpeakingStateUpdate('speaking')
+    setTimeout(() => this.sendSpeakingStateUpdate('idle'), 1000)
   }
 
-  public cleanup(): void {
-    console.log('Cleaning up voice agent...')
-    
-    // Close WebSocket connection
-    if (this.ws) {
-      console.log('Closing WebSocket connection...')
-      this.ws.removeAllListeners() // Remove all event listeners
-      this.ws.close()
-      this.ws = null
-    }
-
-    // Clear keep-alive interval
-    if (this.keepAliveInterval) {
-      clearInterval(this.keepAliveInterval)
-      this.keepAliveInterval = null
-    }
-
-    // Update UI status
-    this.updateStatus('Disconnected')
-    
-    console.log('Voice agent cleanup complete')
-  }
-
-  async updateInstructions(instructions: string) {
-    if (!this.ws || this.ws.readyState !== WebSocket.OPEN) {
-      throw new Error('Agent not connected')
-    }
-
-    const updateMessage = {
-      type: 'UpdateInstructions',
-      instructions
-    }
-
+  /** Update the system prompt at runtime */
+  async updatePrompt(prompt: string) {
+    if (!this.ws || this.ws.readyState !== WebSocket.OPEN) throw new Error('Agent not connected')
+    const updateMessage = { type: 'UpdatePrompt', prompt }
     this.ws.send(JSON.stringify(updateMessage))
   }
 
+  /** Switch TTS model at runtime */
   async updateSpeakModel(model: string) {
-    if (!this.ws || this.ws.readyState !== WebSocket.OPEN) {
-      throw new Error('Agent not connected')
-    }
-
-    const updateMessage = {
-      type: 'UpdateSpeak',
-      model
-    }
-
+    if (!this.ws || this.ws.readyState !== WebSocket.OPEN) throw new Error('Agent not connected')
+    const updateMessage = { type: 'UpdateSpeak', speak: { provider: { type: 'deepgram', model } } }
     this.ws.send(JSON.stringify(updateMessage))
   }
 
+  /** Inject a message spoken by the agent */
   async injectAgentMessage(message: string) {
-    if (!this.ws || this.ws.readyState !== WebSocket.OPEN) {
-      throw new Error('Agent not connected')
-    }
-
-    console.log('Injecting agent message:', message)
-    
-    const injectMessage = {
-      type: 'InjectAgentMessage',
-      message
-    }
-
-    if (this.ws && this.ws.readyState === WebSocket.OPEN) {
-      this.ws.send(JSON.stringify(injectMessage))
-    } else {
-      console.warn('VoiceAgentService: Cannot send message - WebSocket is not open')
-    }
+    if (!this.ws || this.ws.readyState !== WebSocket.OPEN) throw new Error('Agent not connected')
+    const injectMessage = { type: 'InjectAgentMessage', content: message }
+    this.ws.send(JSON.stringify(injectMessage))
   }
 
-  async handleFunctionCall(functionCallId: string, func: any) {
-    console.log('Handling function call:', { functionCallId, func })
+  /** Execute function call requests from the agent */
+  private async handleFunctionCall(functionCallId: string, func: { name: string; arguments: string }) {
+    if (!this.ws || this.ws.readyState !== WebSocket.OPEN) throw new Error('Agent not connected')
 
-    if (!this.ws || this.ws.readyState !== WebSocket.OPEN) {
-      throw new Error('Agent not connected')
-    }
-
-    // Inject a message to let the user know we're working on their request
     try {
-      await this.injectAgentMessage("Let me work on that, standby.")
-      console.log('Injected standby message')
-    } catch (error) {
-      console.warn('Could not inject standby message:', error)
-      // Continue with function execution even if message injection fails
-    }
+      if (!this.isProcessingRequest) {
+        await this.injectAgentMessage('Working on that…');
+        this.isProcessingRequest = true;
+      }
+    } catch {}
 
     if (func.name === 'generateProjectSpec') {
-      console.log('Generating project spec...')
       try {
         await this.specGenerator.generateSpec()
-        const successMessage = 'Project specification has been generated and saved to project_spec.md'
-        this.updateTranscript(successMessage)
-        this.conversationLogger.logEntry({
-          role: 'assistant',
-          content: successMessage
-        })
-        return { 
-          success: true,
-          message: successMessage
-        }
+        const msg = 'Project specification has been generated and saved to project_spec.md'
+        this.updateTranscript(msg)
+        this.conversationLogger.logEntry({ role: 'assistant', content: msg })
+        return { success: true, message: msg }
       } catch (error) {
-        console.error('Failed to generate project spec:', error)
-        const errorMessage = `Failed to generate project specification: ${(error as Error).message}`
-        this.updateTranscript(errorMessage)
-        this.conversationLogger.logEntry({
-          role: 'assistant',
-          content: errorMessage
-        })
-        return { 
-          success: false, 
-          error: errorMessage
-        }
+        const errMsg = `Failed to generate project specification: ${(error as Error).message}`
+        this.updateTranscript(errMsg)
+        this.conversationLogger.logEntry({ role: 'assistant', content: errMsg })
+        return { success: false, error: errMsg }
       }
     }
 
     if (func.name === 'execute_command') {
-      console.log('Handling execute_command function call:', func)
-      const args = JSON.parse(func.arguments)
+      const args = JSON.parse(func.arguments || '{}') as { name: string; args?: string[] }
       try {
-        await this.commandRegistry.executeCommand(args.name, args.args)
-        return { success: true }
+        // Check if the command exists
+        const availableCommands = await vscode.commands.getCommands(true);
+        if (!availableCommands.includes(args.name)) {
+          const errMsg = `Command '${args.name}' not found in VS Code.`;
+          this.updateTranscript(errMsg);
+          this.conversationLogger.logEntry({ role: 'assistant', content: errMsg });
+          return { success: false, error: errMsg };
+        }
+        await this.commandRegistry.executeCommand(args.name, args.args);
+        return { success: true };
       } catch (error) {
-        console.error('Command execution failed:', error)
-        return { 
-          success: false, 
-          error: (error as Error).message 
+        const errMsg = `Failed to execute command '${args.name}': ${(error as Error).message}`;
+        this.updateTranscript(errMsg);
+        this.conversationLogger.logEntry({ role: 'assistant', content: errMsg });
+        return { success: false, error: errMsg };
+      }
+    }
+
+    if (func.name === 'readFile') {
+      const args = JSON.parse(func.arguments || '{}') as { filePath: string; startLine?: number; endLine?: number }
+      try {
+        const fileUri = vscode.Uri.joinPath(vscode.workspace.workspaceFolders![0].uri, args.filePath)
+        const content = await vscode.workspace.fs.readFile(fileUri)
+        let result = content.toString()
+        if (args.startLine && args.endLine) {
+          const lines = result.split('\n')
+          const start = Math.max(1, args.startLine) - 1
+          const end = Math.min(lines.length, args.endLine)
+          result = lines.slice(start, end).join('\n')
         }
+        const msg = `File ${args.filePath} read successfully${args.startLine && args.endLine ? ` (lines ${args.startLine}-${args.endLine})` : ''}`
+        this.updateTranscript(msg)
+        this.conversationLogger.logEntry({ role: 'assistant', content: msg })
+        return { success: true, content: result, message: msg }
+      } catch (error) {
+        const errMsg = `Failed to read file ${args.filePath}: ${(error as Error).message}`
+        this.updateTranscript(errMsg)
+        this.conversationLogger.logEntry({ role: 'assistant', content: errMsg })
+        return { success: false, error: errMsg }
       }
     }
 
-    console.error('Unknown function:', func.name)
-    return { 
-      success: false, 
-      error: `Unknown function: ${func.name}` 
-    }
-  }
-
-  private handleRawAudio(data: Buffer) {
-    console.log('Received raw audio data, length:', data.length, 
-      'sample rate:', this.AGENT_SAMPLE_RATE)
-    
-    // Instead of using the native speaker, send the raw audio data to the webview
-    if (!this.agentPanel) {
-      console.warn('No agent panel available for audio playback')
-      return
-    }
-    
-    // Convert the raw PCM buffer to base64 for sending to the webview
-    const base64Audio = data.toString('base64')
-    
-    // Send the audio data to the webview with explicit sample rate info
-    this.agentPanel.postMessage({
-      type: 'playAudio',
-      audio: {
-        data: base64Audio,
-        encoding: 'linear16',
-        sampleRate: this.AGENT_SAMPLE_RATE,
-        isRaw: true
+    if (func.name === 'navigateToFile') {
+      const args = JSON.parse(func.arguments || '{}') as { filePath: string; startLine?: number; endLine?: number }
+      try {
+        const fileUri = vscode.Uri.joinPath(vscode.workspace.workspaceFolders![0].uri, args.filePath)
+        const document = await vscode.workspace.openTextDocument(fileUri)
+        const editor = await vscode.window.showTextDocument(document)
+        if (args.startLine) {
+          const start = new vscode.Position(Math.max(0, args.startLine - 1), 0)
+          const end = args.endLine ? new vscode.Position(Math.max(0, args.endLine - 1), 0) : start
+          editor.selection = new vscode.Selection(start, end)
+          editor.revealRange(new vscode.Range(start, end))
+        }
+        const msg = `Navigated to file ${args.filePath}${args.startLine ? ` at line ${args.startLine}` : ''}`
+        this.updateTranscript(msg)
+        this.conversationLogger.logEntry({ role: 'assistant', content: msg })
+        this.isProcessingRequest = false; // Reset after successful navigation
+        return { success: true, message: msg }
+      } catch (error) {
+        const errMsg = `Failed to navigate to file ${args.filePath}: ${(error as Error).message}`
+        this.updateTranscript(errMsg)
+        this.conversationLogger.logEntry({ role: 'assistant', content: errMsg })
+        return { success: false, error: errMsg }
       }
-    })
-    
-    // Update speaking state
-    this.sendSpeakingStateUpdate('speaking')
-    
-    // Set a timeout to update the speaking state back to idle
-    // This is a simple approach; a more sophisticated approach would track when playback ends
-    setTimeout(() => {
-      this.sendSpeakingStateUpdate('idle')
-    }, 1000) // Adjust timeout based on typical audio length
+    }
+
+    return { success: false, error: `Unknown function: ${func.name}` }
   }
 
+    /** Build Settings message sent after Welcome */
   private async getAgentConfig(): Promise<AgentConfig> {
-    const commands = this.commandRegistry.getCommandDefinitions()
-    const fileTree = await this.workspaceService.getFileTree()
-    const formattedTree = this.workspaceService.formatFileTree(fileTree)
-    
+    const commands = this.commandRegistry.getCommandDefinitions();
+    const prompt = await this.getAgentPrompt();
+
     return {
-      type: 'SettingsConfiguration',
+      type: 'Settings',
       audio: {
-        input: {
-          encoding: 'linear16',
-          sample_rate: 16000
-        },
-        output: {
-          encoding: 'linear16',
-          sample_rate: 24000,
-          container: 'none'
-        }
+        input: { encoding: 'linear16', sample_rate: this.INPUT_SAMPLE_RATE },
+        output: { encoding: 'linear16', sample_rate: this.OUTPUT_SAMPLE_RATE, container: 'none' },
       },
       agent: {
-        listen: {
-          model: 'nova-2'
-        },
+        language: 'en',
+        listen: { provider: { type: 'deepgram', model: 'nova-3' } },
         think: {
-          provider: {
-            type: 'open_ai'
-          },
-          model: 'gpt-4o-mini',
-          instructions: `You are a coding mentor and VS Code assistant. You help users navigate and control VS Code through voice commands. You also help users think through their product and application. You ask questions, one at a time, using the socratic method to help the user think critically, unless the user explicitly asks you for suggestions or ideas.
-
-          Everything you say will be spoken out load through a TTS system, so do not use markdown or other formatting, and keep your responses concise.
-          
-          Current Workspace Structure:
-          ${formattedTree}
-
-          When a user requests an action that matches a VS Code command, use the execute_command function.
-          You can help users navigate the file structure and open files using the paths shown above.
-          You can also generate project specifications from our conversation using the generateProjectSpec function.
-          Provide helpful feedback about what you're doing and guide users if they need help.`,
+          provider: { type: 'open_ai', model: 'gpt-4.1-mini' },
+          prompt,
           functions: [
             {
               name: 'execute_command',
@@ -656,168 +589,173 @@ export class VoiceAgentService {
               parameters: {
                 type: 'object',
                 properties: {
-                  name: {
-                    type: 'string',
-                    description: 'Name of the command to execute'
-                  },
-                  args: {
-                    type: 'array',
-                    description: 'Arguments for the command',
-                    items: {
-                      type: 'string'
-                    }
-                  }
+                  name: { type: 'string', description: 'Name of the command to execute' },
+                  args: { type: 'array', description: 'Arguments for the command', items: { type: 'string' } },
                 },
-                required: ['name']
-              }
+                required: ['name'],
+              },
             },
             {
               name: 'generateProjectSpec',
               description: 'Generate a project specification document from the conversation history',
               parameters: {
                 type: 'object',
+                properties: { format: { type: 'string', enum: ['markdown'], description: 'Output format' } },
+                required: ['format'],
+              },
+            },
+            {
+              name: 'readFile',
+              description: 'Read the contents of a specific file, optionally from a start line to an end line',
+              parameters: {
+                type: 'object',
                 properties: {
-                  format: {
-                    type: 'string',
-                    enum: ['markdown'],
-                    description: 'Output format (currently only supports markdown)'
-                  }
+                  filePath: { type: 'string', description: 'Relative path to the file in the workspace' },
+                  startLine: { type: 'number', description: 'Starting line number (1-based, optional)' },
+                  endLine: { type: 'number', description: 'Ending line number (1-based, optional)' },
                 },
-                required: ['format']
-              }
-            }
-          ]
+                required: ['filePath'],
+              },
+            },
+            {
+              name: 'navigateToFile',
+              description: 'Navigate to a specific file in the VS Code editor, optionally to a specific line range',
+              parameters: {
+                type: 'object',
+                properties: {
+                  filePath: { type: 'string', description: 'Relative path to the file in the workspace' },
+                  startLine: { type: 'number', description: 'Starting line number to navigate to (1-based, optional)' },
+                  endLine: { type: 'number', description: 'Ending line number to select (1-based, optional)' },
+                },
+                required: ['filePath'],
+              },
+            },
+          ],
         },
-        speak: {
-          model: 'aura-2-speaker-180',
-          temp: 0.45,
-          rep_penalty: 2.0
-        }
+        speak: { provider: { type: 'deepgram', model: 'aura-2-thalia-en' } },
+      },
+    };
+  }
+
+  /** Generate the agent prompt with workspace and active file context */
+  private async getAgentPrompt(): Promise<string> {
+      const fileTree = await this.workspaceService.getFileTree();
+      const formattedTree = this.workspaceService.formatFileTree(fileTree);
+      return `You are a coding mentor and VS Code assistant. You help users navigate and control VS Code through voice commands. Ask questions one at a time using the Socratic method unless explicitly asked for suggestions.
+        Everything you say will be spoken aloud via TTS, so avoid formatting and keep responses concise.
+
+        Be proactive in assisting users. For tasks like finding a specific part of code or navigating to it, actively search by calling readFile on relevant files (using line ranges if possible to be efficient), analyze the returned content, and if not found, call readFile on other potential files. Once located, use navigateToFile to move the editor there. Do not speak or respond until the task is completed (e.g., navigation done) or if you need clarification from the user. You can make multiple function calls in sequence or parallel as needed before concluding and speaking.
+
+        When calling execute_command, ensure the command is valid for VS Code (e.g., 'workbench.action.openEditorAtIndex', 'workbench.action.gotoLine'). If unsure about a command's existence, avoid calling it and instead inform the user that the command is not recognized, suggesting they clarify or provide a different command.
+
+        Current Workspace Structure:
+        ${formattedTree}
+
+        Current Active File:
+        ${this.getActiveFileContext()}
+
+        When a user requests an action matching a VS Code command, call execute_command only if the command is valid.
+        You can help users navigate the file structure and open files using the paths shown above.
+        You can also generate project specifications from our conversation using the generateProjectSpec function.
+        You can read file contents using the readFile function, optionally specifying line ranges.
+        You can navigate to specific files and line ranges using the navigateToFile function.
+        Provide helpful feedback about what you're doing and guide users if they need help.`;
+  }
+  /** Send a text message to the agent and await first AgentResponse */
+  private async sendToAgent(text: string) {
+    if (!this.ws || this.ws.readyState !== WebSocket.OPEN) throw new Error('Agent not connected')
+
+    const message = { type: 'UserText', text }
+    this.ws.send(JSON.stringify(message))
+
+    return new Promise<{ text?: string }>((resolve) => {
+      const handler = (data: WebSocket.Data, isBinary?: boolean) => {
+        if (isBinary || this.isBinaryFrame(data)) return // ignore audio frames here
+        try {
+          const json = JSON.parse(typeof data === 'string' ? data : this.toBuffer(data).toString('utf8'))
+          if (json?.type === 'AgentResponse') {
+            this.ws?.off('message', handler as any)
+            resolve({ text: json.text })
+          }
+        } catch {}
       }
-    }
+      this.ws?.on('message', handler as any)
+    })
   }
 
-  dispose(): void {
-    this.cleanup()
+  /** Public API: set webview bridge */
+  public setAgentPanel(handler: MessageHandler | undefined) {
+    this.agentPanel = handler
   }
 
+  /** Event subscription for transcripts */
   onTranscript(callback: (text: string) => void) {
     this.eventEmitter.on('transcript', callback)
     return () => this.eventEmitter.off('transcript', callback)
   }
 
+  /** Update webview UI state */
   private sendSpeakingStateUpdate(state: 'speaking' | 'idle') {
-    console.log('Sending speaking state update:', state)
-    if (!this.agentPanel) {
-      console.warn('No agent panel available for state update')
-      return
-    }
-    
-    // Send status text instead of animation state
+    if (!this.agentPanel) return
     this.agentPanel.postMessage({
       type: 'updateStatus',
       text: state === 'speaking' ? 'Agent Speaking...' : 'Ready',
-      target: 'vibe-status'
+      target: 'vibe-status',
     })
   }
 
-  public setAgentPanel(handler: MessageHandler | undefined) {
-    this.agentPanel = handler
+  /** Dispose all resources */
+  public dispose(): void { this.cleanup() }
+
+  /** Disconnect and clear timers/streams */
+  public cleanup(): void {
+    console.log('Cleaning up voice agent...')
+
+    if (this.currentMic) {
+      try { this.currentMic.stopRecording() } catch {}
+      this.currentMic = null
+    }
+
+    if (this.ws) {
+      try { this.ws.removeAllListeners() } catch {}
+      try { this.ws.close() } catch {}
+      this.ws = null
+    }
+    if (this.keepAliveInterval) { clearInterval(this.keepAliveInterval); this.keepAliveInterval = null }
+    if (this.jsonKeepAliveInterval) { clearInterval(this.jsonKeepAliveInterval); this.jsonKeepAliveInterval = null }
+
+    this.updateStatus('Disconnected')
   }
 
+  /** Helper: detect binary frame shapes from ws */
+  private isBinaryFrame(d: WebSocket.Data): boolean {
+    return Buffer.isBuffer(d) || d instanceof ArrayBuffer || Array.isArray(d)
+  }
+
+  /** Helper: normalize to Buffer */
+  private toBuffer(d: WebSocket.Data): Buffer {
+    if (Buffer.isBuffer(d)) return d
+    if (Array.isArray(d)) return Buffer.concat(d as Buffer[])
+    if (d instanceof ArrayBuffer) return Buffer.from(new Uint8Array(d))
+    return Buffer.from(d as any)
+  }
+
+  /** Get context of the currently active file */
+  private getActiveFileContext(): string {
+    const activeEditor = vscode.window.activeTextEditor;
+    if (!activeEditor) return "No active file.";
+    const filePath = vscode.workspace.asRelativePath(activeEditor.document.uri.fsPath);
+    const content = activeEditor.document.getText();
+    return `File: ${filePath}\nContent:\n${content.slice(0, 1000)}${content.length > 1000 ? '...' : ''}`;
+  }
+
+  /** Example of handling an incoming message from your own UI */
   private async handleMessage(message: any) {
     if (message.type === 'text') {
-      console.log('VoiceAgent: Received user message:', message.text)
-      
-      // Log user messages
-      this.conversationLogger.logEntry({ 
-        role: 'user', 
-        content: message.text 
-      })
-      console.log('VoiceAgent: Logged user message to conversation')
-      
-      // Send to agent and handle response
+      this.conversationLogger.logEntry({ role: 'user', content: message.text })
       const response = await this.sendToAgent(message.text)
-      console.log('VoiceAgent: Got response from agent:', response)
-      
-      // Log assistant responses
-      if (response.text) {
-        console.log('VoiceAgent: Logging assistant response')
-        this.conversationLogger.logEntry({ 
-          role: 'assistant', 
-          content: response.text 
-        })
-      }
-      
-      // Update UI with response
+      if (response.text) this.conversationLogger.logEntry({ role: 'assistant', content: response.text })
       this.updateTranscript(response.text || 'No response from agent')
     }
-    // ... rest of the message handling
   }
-
-  private async handleAgentResponse(response: any) {
-    console.log('VoiceAgent: Handling agent response:', response)
-    
-    // Log the agent's response before handling function calls
-    if (response.text) {
-      console.log('VoiceAgent: Logging agent response to conversation')
-      this.conversationLogger.logEntry({
-        role: 'assistant',
-        content: response.text
-      })
-    }
-
-    if (response.function_call?.name === 'generateProjectSpec') {
-      try {
-        await this.specGenerator.generateSpec()
-        const successMessage = 'Project specification has been generated and saved to project_spec.md'
-        this.updateTranscript(successMessage)
-        // Log the success message as well
-        this.conversationLogger.logEntry({
-          role: 'assistant',
-          content: successMessage
-        })
-      } catch (err) {
-        const error = err as Error
-        const errorMessage = `Error generating spec: ${error?.message || 'Unknown error'}`
-        this.updateTranscript(errorMessage)
-        // Log the error message
-        this.conversationLogger.logEntry({
-          role: 'assistant',
-          content: errorMessage
-        })
-      }
-    }
-  }
-
-  private async sendToAgent(text: string) {
-    if (!this.ws || this.ws.readyState !== WebSocket.OPEN) {
-      throw new Error('Agent not connected')
-    }
-
-    const message = {
-      type: 'UserText',
-      text
-    }
-
-    this.ws.send(JSON.stringify(message))
-
-    // Return a promise that resolves when we get a response
-    return new Promise<{ text?: string }>((resolve) => {
-      const messageHandler = (data: WebSocket.Data) => {
-        const response = JSON.parse(data.toString())
-        if (response.type === 'AgentResponse') {
-          // Use optional chaining and ensure ws exists before removing listener
-          this.ws?.off('message', messageHandler)
-          resolve({ text: response.text })
-        }
-      }
-      // Add null check before adding event listener
-      if (this.ws) {
-        this.ws.on('message', messageHandler)
-      } else {
-        resolve({ text: 'Error: WebSocket connection lost' })
-      }
-    })
-  }
-} 
+}

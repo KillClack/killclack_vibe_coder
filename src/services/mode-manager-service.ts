@@ -6,6 +6,7 @@ import { PromptManagementService } from './prompt-management-service'
 import { CommandRegistryService } from './command-registry-service'
 import { ConversationLoggerService } from './conversation-logger-service'
 import { SpecGeneratorService } from './spec-generator-service'
+import { VibeCoderViewProvider } from '../webview/vibe-coder-view-provider'
 
 export type Mode = 'vibe' | 'code'
 
@@ -15,8 +16,9 @@ export class ModeManagerService {
   private readonly llmService: LLMService
   public readonly promptManager: PromptManagementService
   public currentMode: Mode = 'code'
-  private panel: vscode.WebviewPanel | undefined
+  private viewProvider: VibeCoderViewProvider | undefined
   private isInitialized = false
+  private isViewReady = false
   private finalTranscripts: string[] = []
   private interimTranscript = ''
   private isDictationActive = false
@@ -35,7 +37,7 @@ export class ModeManagerService {
     this.voiceAgentService = new VoiceAgentService({
       context,
       updateStatus: (status: string) => {
-        this.panel?.webview.postMessage({ 
+        this.postMessage({ 
           type: 'updateStatus', 
           text: status,
           target: 'vibe-status'
@@ -43,7 +45,7 @@ export class ModeManagerService {
       },
       updateTranscript: (text: string) => {
         this.conversationLogger.logEntry({ role: 'assistant', content: text })
-        this.panel?.webview.postMessage({ 
+        this.postMessage({ 
           type: 'updateTranscript', 
           text,
           target: 'agent-transcript'
@@ -64,6 +66,47 @@ export class ModeManagerService {
     )
 
     this.commandRegistry = new CommandRegistryService()
+    
+    // Initialize the view provider
+    this.initializeViewProvider()
+  }
+
+  private initializeViewProvider() {
+    this.viewProvider = new VibeCoderViewProvider(
+      this.context.extensionUri,
+      () => this.getWebviewContent(),
+      (message) => this.handleMessage(message)
+    )
+
+    // Register the view provider
+    this.context.subscriptions.push(
+      vscode.window.registerWebviewViewProvider(
+        VibeCoderViewProvider.viewType,
+        this.viewProvider
+      )
+    )
+
+    // Listen for when the webview becomes available
+    this.viewProvider.onDidChangeWebview((webview) => {
+      if (webview) {
+        this.isViewReady = true
+        this.onViewReady()
+      } else {
+        this.isViewReady = false
+      }
+    })
+  }
+
+  private onViewReady() {
+    // Set up the voice agent panel reference
+    this.voiceAgentService.setAgentPanel({
+      postMessage: (message: unknown): Thenable<boolean> => {
+        return this.viewProvider?.postMessage(message) || Promise.resolve(false)
+      }
+    })
+    
+    // Refresh prompts and other initialization
+    this.refreshPrompts()
   }
 
   async initialize(): Promise<void> {
@@ -99,7 +142,7 @@ export class ModeManagerService {
           this.interimTranscript = text
         }
         const displayTranscript = this.finalTranscripts.join(' ') + (this.interimTranscript ? ' ' + this.interimTranscript : '')
-        this.panel?.webview.postMessage({ 
+        this.postMessage({ 
           type: 'updateTranscript', 
           text: displayTranscript,
           target: 'transcript'
@@ -108,51 +151,210 @@ export class ModeManagerService {
     })
   }
 
-  private createPanel() {
-    const editor = vscode.window.activeTextEditor
-    const columnWidth = editor?.visibleRanges[0]?.end.character || 120
-    const panelColumn = Math.floor(columnWidth * 0.4)
+  private postMessage(message: any) {
+    if (this.viewProvider) {
+      this.viewProvider.postMessage(message)
+    }
+  }
 
-    this.panel = vscode.window.createWebviewPanel(
-      'vibeCoder.panel',
-      'Vibe Coder',
-      {
-        viewColumn: vscode.ViewColumn.Beside,
-        preserveFocus: true
-      },
-      {
-        enableScripts: true,
-        retainContextWhenHidden: true,
-        localResourceRoots: [
-          vscode.Uri.joinPath(this.context.extensionUri, '')
-        ]
-      }
-    )
-
-    this.panel.webview.html = this.getWebviewContent()
-    this.setupMessageHandling()
+  private async handleMessage(message: any) {
+    console.log('Received message:', message)
     
-    this.voiceAgentService.setAgentPanel({
-      postMessage: (message: unknown): Thenable<boolean> => {
-        console.log('Forwarding message to webview:', message)
-        return this.panel?.webview.postMessage(message) || Promise.resolve(false)
-      }
-    })
-
-    if (this.panel) {
-      this.panel.onDidChangeViewState(e => {
-        if (e.webviewPanel.visible) {
-          vscode.commands.executeCommand('workbench.action.setEditorLayoutSize', {
-            id: this.panel?.viewColumn,
-            size: panelColumn
+    switch (message.type) {
+      case 'error':
+        console.error('Webview error:', message.message)
+        vscode.window.showErrorMessage(message.message)
+        break
+      
+      case 'audioEnded':
+        console.log('Audio playback ended')
+        break
+      
+      case 'switchMode':
+        await this.setMode(message.mode as Mode)
+        break
+      
+      case 'toggleDictation':
+        await this.toggleDictation()
+        break
+      
+      case 'setPrompt':
+        await this.promptManager.setCurrentPrompt(message.id)
+        this.refreshPrompts()
+        break
+      
+      case 'getApiKeyStatus':
+        const hasDeepgramKey = !!(await this.context.secrets.get('deepgram.apiKey'))
+        const hasOpenAIKey = !!(await this.context.secrets.get('openai.apiKey'))
+        this.postMessage({ 
+          type: 'apiKeyStatus', 
+          hasDeepgramKey,
+          hasOpenAIKey
+        })
+        break
+      
+      case 'saveApiKey':
+        if (message.service === 'deepgram') {
+          await this.context.secrets.store('deepgram.apiKey', message.key)
+          vscode.window.showInformationMessage('Deepgram API key saved')
+          try {
+            this.deepgramService.updateApiKey(message.key)
+          } catch (error) {
+            console.error('Failed to update Deepgram API key:', error)
+          }
+        } else if (message.service === 'openai') {
+          await this.context.secrets.store('openai.apiKey', message.key)
+          vscode.window.showInformationMessage('OpenAI API key saved')
+        }
+        break
+      
+      case 'clearApiKey':
+        if (message.service === 'deepgram') {
+          await this.context.secrets.delete('deepgram.apiKey')
+          vscode.window.showInformationMessage('Deepgram API key cleared')
+        } else if (message.service === 'openai') {
+          await this.context.secrets.delete('openai.apiKey')
+          vscode.window.showInformationMessage('OpenAI API key cleared')
+        }
+        break
+      
+      case 'getMicrophoneDevices':
+        try {
+          const micConfig = vscode.workspace.getConfiguration('vibeCoder.microphone')
+          const currentPlatform = process.platform
+          let configuredDevice = ''
+          
+          if (currentPlatform === 'darwin') {
+            configuredDevice = micConfig.get<string>('deviceMacOS') || ''
+          } else if (currentPlatform === 'win32') {
+            configuredDevice = micConfig.get<string>('deviceWindows') || ''
+          } else {
+            configuredDevice = micConfig.get<string>('deviceLinux') || ''
+          }
+          
+          let devices: string[] = ['default']
+          
+          if (currentPlatform === 'darwin') {
+            devices = ['default', 'Built-in Microphone']
+            devices.push('MacBook Pro Microphone', 'Headset Microphone')
+          } else if (currentPlatform === 'win32') {
+            devices.push('Microphone (Realtek Audio)', 'Headset Microphone')
+          } else {
+            devices.push('plughw:0,0', 'plughw:1,0')
+          }
+          
+          this.postMessage({
+            type: 'microphoneDevices',
+            devices,
+            configuredDevice
+          })
+          
+          if (currentPlatform !== 'darwin') {
+            vscode.commands.executeCommand('vibeCoder.listMicrophoneDevices')
+              .then(() => {}, (err: Error) => {
+                console.error('Failed to list microphone devices:', err)
+              })
+          } else {
+            console.log('Using default microphone device list for macOS')
+          }
+        } catch (error) {
+          console.error('Error getting microphone devices:', error)
+          this.postMessage({
+            type: 'microphoneDevices',
+            devices: ['default'],
+            configuredDevice: ''
           })
         }
-      })
+        break
+      
+      case 'testMicrophone':
+        vscode.commands.executeCommand('vibeCoder.testMicrophone')
+          .then(() => {
+            this.postMessage({
+              type: 'microphoneTestResult',
+              success: true,
+              message: 'Microphone test successful! Audio is being captured correctly.'
+            })
+          }, (error: Error) => {
+            this.postMessage({
+              type: 'microphoneTestResult',
+              success: false,
+              message: 'Microphone test failed: ' + error.message
+            })
+          })
+        break
+      
+      case 'saveMicrophoneDevice':
+        try {
+          const micConfig = vscode.workspace.getConfiguration('vibeCoder.microphone')
+          const currentPlatform = process.platform
+          
+          if (currentPlatform === 'darwin') {
+            await micConfig.update('deviceMacOS', message.device, vscode.ConfigurationTarget.Global)
+          } else if (currentPlatform === 'win32') {
+            await micConfig.update('deviceWindows', message.device, vscode.ConfigurationTarget.Global)
+          } else {
+            await micConfig.update('deviceLinux', message.device, vscode.ConfigurationTarget.Global)
+          }
+          
+          vscode.window.showInformationMessage('Microphone device settings saved')
+        } catch (error) {
+          console.error('Error saving microphone device:', error)
+          vscode.window.showErrorMessage('Failed to save microphone device settings')
+        }
+        break
+      
+      case 'getPromptsList':
+        const prompts = [
+          this.promptManager.getDefaultPrompt(),
+          ...this.promptManager.getAllPrompts()
+        ]
+        this.postMessage({
+          type: 'promptsList',
+          prompts
+        })
+        break
+      
+      case 'getPromptPreview':
+        const prompt = message.id === 'default' 
+          ? this.promptManager.getDefaultPrompt() 
+          : this.promptManager.getPromptById(message.id)
+          
+        if (prompt) {
+          this.postMessage({
+            type: 'promptPreview',
+            id: prompt.id,
+            prompt: prompt.prompt
+          })
+        }
+        break
+      
+      case 'createPrompt':
+        vscode.commands.executeCommand('vibe-coder.managePrompts')
+        break
+      
+      case 'editPrompt':
+        vscode.commands.executeCommand('vibe-coder.managePrompts', { action: 'edit', id: message.id })
+        break
+      
+      case 'deletePrompt':
+        await this.promptManager.deletePrompt(message.id)
+        const updatedPrompts = [
+          this.promptManager.getDefaultPrompt(),
+          ...this.promptManager.getAllPrompts()
+        ]
+        this.postMessage({
+          type: 'promptsList',
+          prompts: updatedPrompts
+        })
+        vscode.window.showInformationMessage('Prompt deleted successfully')
+        break
+      
+      case 'setDefaultPrompt':
+        await this.promptManager.setCurrentPrompt(message.id)
+        vscode.window.showInformationMessage('Prompt set as default')
+        break
     }
-
-    this.panel.onDidDispose(() => {
-      this.cleanup()
-    })
   }
 
   private getWebviewContent() {
@@ -188,7 +390,6 @@ export class ModeManagerService {
       }
     `
 
-    // Use single quotes for the JS to avoid backtick conflicts
     const audioPlayerJs = `
     // Audio processing utilities
     function createAudioBuffer(audioContext, data, sampleRate = 24000) {
@@ -452,6 +653,10 @@ export class ModeManagerService {
       <html>
         <head>
           <style>
+          /* Hide dictation button and hotkey in vibe mode */
+          .vibe-mode .code-only {
+            display: none;
+          }
             body {
               padding: 20px;
               font-family: 'Courier New', monospace;
@@ -460,6 +665,8 @@ export class ModeManagerService {
               margin: 0;
               min-height: 100vh;
             }
+            
+            /* Mode Toggle Button Styles */
             .mode-toggle {
               display: flex;
               background: ${matrixBlack};
@@ -471,6 +678,7 @@ export class ModeManagerService {
               position: relative;
               z-index: 1;
             }
+            
             .mode-button {
               padding: 8px 24px;
               border-radius: 20px;
@@ -483,14 +691,18 @@ export class ModeManagerService {
               background: transparent;
               color: ${matrixGreen};
             }
+            
             .mode-button.active {
               background: ${matrixDarkGreen};
               text-shadow: 0 0 8px ${matrixGreen}, 0 0 12px ${matrixGreen};
               box-shadow: 0 0 12px rgba(0, 255, 65, 0.3);
             }
+            
             .mode-button:not(.active) {
               opacity: 0.7;
             }
+            
+            /* Container Styles */
             .content-container {
               width: 100%;
               height: calc(100vh - 100px);
@@ -498,6 +710,8 @@ export class ModeManagerService {
               flex-direction: column;
               position: relative;
             }
+            
+            /* Section Base Styles */
             .vibe-section, .code-section {
               position: relative;
               padding: 20px;
@@ -505,17 +719,33 @@ export class ModeManagerService {
               overflow: hidden;
               background: rgba(0, 0, 0, 0.05);
             }
-            .vibe-section {
-              height: 40%;
+            
+            /* MODE-SPECIFIC VISIBILITY - THIS IS THE KEY PART */
+            /* When in vibe mode */
+            .vibe-mode .vibe-section {
               display: flex;
               flex-direction: column;
               align-items: center;
               justify-content: center;
+              height: 100%;
             }
-            .code-section {
-              height: 60%;
+            
+            .vibe-mode .code-section {
+              display: none;
+            }
+            
+            /* When in code mode */
+            .code-mode .vibe-section {
+              display: none;
+            }
+            
+            .code-mode .code-section {
+              display: block;
+              height: 100%;
               overflow-y: auto;
             }
+            
+            /* Section Overlay */
             .section-overlay {
               position: absolute;
               top: 0;
@@ -530,9 +760,12 @@ export class ModeManagerService {
               -webkit-backdrop-filter: blur(4px);
               z-index: 1000;
             }
+            
             .section-overlay.inactive {
               opacity: 0.8;
             }
+            
+            /* Vibe Mode Specific Elements */
             .matrix-canvas {
               position: absolute;
               top: 0;
@@ -541,11 +774,13 @@ export class ModeManagerService {
               height: 100%;
               z-index: 0;
             }
+            
             .status {
               z-index: 1;
               color: ${matrixGreen};
               margin-bottom: 10px;
             }
+            
             .headphones-notice {
               z-index: 1;
               color: ${matrixGreen};
@@ -558,6 +793,29 @@ export class ModeManagerService {
               text-align: center;
               max-width: 90%;
             }
+            
+            .terminal-text {
+              font-family: 'Courier New', monospace;
+              color: ${matrixGreen};
+              white-space: pre-wrap;
+              line-height: 1.4;
+              position: relative;
+              z-index: 1;
+              min-height: 20px;
+            }
+            
+            .terminal-text::after {
+              content: '▋';
+              animation: blink 1s step-end infinite;
+              margin-left: 2px;
+            }
+            
+            @keyframes blink {
+              0%, 100% { opacity: 1; }
+              50% { opacity: 0; }
+            }
+            
+            /* Code Mode Specific Elements */
             .transcription-container {
               background: rgba(0, 59, 0, 0.3);
               border: 1px solid ${matrixGreen};
@@ -566,12 +824,14 @@ export class ModeManagerService {
               position: relative;
               overflow: hidden;
             }
+            
             .container-label {
               color: ${matrixGreen};
               font-size: 12px;
               text-transform: uppercase;
               letter-spacing: 1px;
             }
+            
             #transcript {
               color: ${matrixGreen};
               font-size: 14px;
@@ -582,6 +842,7 @@ export class ModeManagerService {
               margin: 0;
               padding: 0;
             }
+            
             .processing-container {
               display: flex;
               flex-direction: column;
@@ -589,6 +850,7 @@ export class ModeManagerService {
               padding: 4px 0;
               margin: 20px 0;
             }
+            
             .status-display {
               display: flex;
               align-items: center;
@@ -599,6 +861,7 @@ export class ModeManagerService {
               padding-bottom: 4px;
               justify-content: center;
             }
+            
             .success-message {
               color: ${matrixGreen};
               font-size: 12px;
@@ -606,19 +869,21 @@ export class ModeManagerService {
               transition: opacity 0.3s ease;
               padding-top: 4px;
             }
+            
             .success-message.visible {
               opacity: 0.8;
             }
+            
             .prompt-container {
               background: rgba(0, 59, 0, 0.2);
               border: 1px solid ${matrixGreen};
               border-radius: 4px;
               padding: 20px;
-              padding-bottom: 70px;
+              padding-bottom: 20px;  /* Changed from 70px */
               position: relative;
               height: auto;
-              min-height: 150px;
-              max-height: 250px;
+              min-height: 80px;      /* Changed from 150px - smaller default */
+              max-height: 120px;     /* Changed from 250px - smaller default */
               margin-top: 20px;
               margin-bottom: 20px;
               overflow: hidden;
@@ -626,9 +891,9 @@ export class ModeManagerService {
               flex-direction: column;
               transition: max-height 0.3s ease;
             }
-            
+
             .prompt-container:hover {
-              max-height: 350px;
+              max-height: 350px;     /* Keep same expansion on hover */
             }
             
             #prompt-output {
@@ -636,16 +901,16 @@ export class ModeManagerService {
               font-size: 13px;
               line-height: 1.5;
               white-space: pre-wrap;
-              height: auto;
+              height: 60px;          /* Add fixed height */
               max-height: 100%;
               overflow-y: auto;
               padding-right: 10px;
               scrollbar-width: thin;
               scrollbar-color: ${matrixDarkGreen} ${matrixBlack};
             }
-            
-            #prompt-output::-webkit-scrollbar {
-              width: 6px;
+
+            .prompt-container:hover #prompt-output {
+              height: auto;          /* Allow expansion on hover */
             }
             
             #prompt-output::-webkit-scrollbar-track {
@@ -656,6 +921,50 @@ export class ModeManagerService {
               background-color: ${matrixDarkGreen};
               border-radius: 3px;
             }
+            
+            .prompt-selection {
+              margin-bottom: 15px;
+              display: flex;
+              align-items: center;
+              gap: 10px;
+            }
+            
+            #prompt-select {
+              background: ${matrixBlack};
+              color: ${matrixGreen};
+              border: 1px solid ${matrixGreen};
+              border-radius: 4px;
+              padding: 8px;
+              appearance: none;
+              -webkit-appearance: none;
+              -moz-appearance: none;
+              background-image: url("data:image/svg+xml;utf8,<svg fill='%2300FF41' height='24' viewBox='0 0 24 24' width='24' xmlns='http://www.w3.org/2000/svg'><path d='M7 10l5 5 5-5z'/><path d='M0 0h24v24H0z' fill='none'/></svg>");
+              background-repeat: no-repeat;
+              background-position: right 8px center;
+              padding-right: 32px;
+              font-family: 'Courier New', monospace;
+              box-shadow: 0 0 8px rgba(0, 255, 65, 0.15);
+              width: 100%;
+              cursor: pointer;
+              transition: all 0.3s ease;
+            }
+            
+            #prompt-select:hover {
+              box-shadow: 0 0 12px rgba(0, 255, 65, 0.3);
+            }
+            
+            #prompt-select:focus {
+              outline: none;
+              box-shadow: 0 0 15px rgba(0, 255, 65, 0.4);
+            }
+            
+            #prompt-select option {
+              background: ${matrixBlack};
+              color: ${matrixGreen};
+              padding: 8px;
+            }
+            
+            /* Controls */
             .controls {
               position: fixed;
               bottom: 20px;
@@ -671,6 +980,7 @@ export class ModeManagerService {
               -webkit-backdrop-filter: blur(3px);
               box-shadow: 0 0 15px rgba(0, 0, 0, 0.6);
             }
+            
             #dictation-toggle {
               background: linear-gradient(to bottom, ${matrixDarkGreen}, rgba(0, 20, 0, 0.8));
               border: 1px solid ${matrixGreen};
@@ -708,6 +1018,7 @@ export class ModeManagerService {
               letter-spacing: 1px;
               margin-right: 15px;
             }
+            
             .icon-button {
               background: rgba(0, 20, 0, 0.6);
               border: 1px solid ${matrixGreen};
@@ -724,6 +1035,8 @@ export class ModeManagerService {
               height: 38px;
               box-shadow: 0 0 6px rgba(0, 255, 65, 0.15);
             }
+            
+            /* Settings Modal */
             .settings-modal {
               display: none;
               position: fixed;
@@ -736,9 +1049,11 @@ export class ModeManagerService {
               justify-content: center;
               align-items: center;
             }
+            
             .settings-modal.visible {
               display: flex;
             }
+            
             .modal-content {
               background: ${matrixBlack};
               border: 1px solid ${matrixGreen};
@@ -749,6 +1064,7 @@ export class ModeManagerService {
               max-height: 80vh;
               overflow-y: auto;
             }
+            
             .modal-header {
               display: flex;
               justify-content: space-between;
@@ -757,12 +1073,14 @@ export class ModeManagerService {
               border-bottom: 1px solid ${matrixDarkGreen};
               padding-bottom: 10px;
             }
+            
             .modal-title {
               color: ${matrixGreen};
               font-size: 18px;
               text-transform: uppercase;
               letter-spacing: 1px;
             }
+            
             .close-button {
               background: transparent;
               border: none;
@@ -771,12 +1089,13 @@ export class ModeManagerService {
               cursor: pointer;
             }
             
-            /* Settings Tabs Styling */
+            /* Settings Tabs */
             .settings-tabs {
               display: flex;
               border-bottom: 1px solid ${matrixDarkGreen};
               margin-bottom: 20px;
             }
+            
             .settings-tab {
               background: transparent;
               border: none;
@@ -790,14 +1109,17 @@ export class ModeManagerService {
               transition: all 0.3s ease;
               position: relative;
             }
+            
             .settings-tab:hover {
               opacity: 1;
               text-shadow: 0 0 8px rgba(0, 255, 65, 0.5);
             }
+            
             .settings-tab.active {
               opacity: 1;
               text-shadow: 0 0 8px rgba(0, 255, 65, 0.7);
             }
+            
             .settings-tab.active::after {
               content: '';
               position: absolute;
@@ -809,25 +1131,28 @@ export class ModeManagerService {
               box-shadow: 0 0 8px rgba(0, 255, 65, 0.7);
             }
             
-            /* Settings Content Styling */
+            /* Settings Content */
             .settings-tab-content {
               display: none;
               padding: 10px 0;
             }
+            
             .settings-tab-content.active {
               display: block;
             }
             
-            /* API Key Section Styling (existing) */
+            /* API Key Section */
             .api-key-section {
               margin-bottom: 20px;
             }
+            
             .api-key-input {
               display: flex;
               align-items: center;
               gap: 10px;
               margin-top: 10px;
             }
+            
             .api-key-input input {
               flex: 1;
               background: ${matrixBlack};
@@ -836,6 +1161,7 @@ export class ModeManagerService {
               border-radius: 4px;
               padding: 8px;
             }
+            
             .api-key-input button {
               background: transparent;
               border: 1px solid ${matrixGreen};
@@ -847,14 +1173,16 @@ export class ModeManagerService {
               letter-spacing: 1px;
               border-radius: 4px;
             }
+            
             .api-key-input button:hover {
               box-shadow: 0 0 12px rgba(0, 255, 65, 0.3);
             }
             
-            /* Microphone Settings Styling */
+            /* Microphone Settings */
             .mic-settings-section {
               margin-bottom: 20px;
             }
+            
             .mic-device-selector {
               display: flex;
               align-items: center;
@@ -862,6 +1190,7 @@ export class ModeManagerService {
               margin-top: 10px;
               margin-bottom: 20px;
             }
+            
             .mic-device-selector select {
               flex: 1;
               background: ${matrixBlack};
@@ -870,6 +1199,7 @@ export class ModeManagerService {
               border-radius: 4px;
               padding: 8px;
             }
+            
             .retro-button {
               background: transparent;
               border: 1px solid ${matrixGreen};
@@ -882,16 +1212,20 @@ export class ModeManagerService {
               border-radius: 4px;
               transition: all 0.3s ease;
             }
+            
             .retro-button:hover {
               box-shadow: 0 0 12px rgba(0, 255, 65, 0.3);
               text-shadow: 0 0 8px rgba(0, 255, 65, 0.5);
             }
+            
             .retro-button.primary {
               background: ${matrixDarkGreen};
             }
+            
             .mic-test-section {
               margin-bottom: 20px;
             }
+            
             .mic-test-result {
               margin-top: 10px;
               padding: 8px;
@@ -900,10 +1234,11 @@ export class ModeManagerService {
               min-height: 20px;
             }
             
-            /* Prompt Management Styling */
+            /* Prompt Management */
             .prompts-list-section {
               margin-bottom: 20px;
             }
+            
             .prompts-list {
               background: rgba(0, 20, 0, 0.3);
               border: 1px solid ${matrixGreen};
@@ -913,27 +1248,33 @@ export class ModeManagerService {
               margin-top: 10px;
               margin-bottom: 10px;
             }
+            
             .prompt-item {
               padding: 8px 12px;
               cursor: pointer;
               border-bottom: 1px solid ${matrixDarkGreen};
               transition: all 0.3s ease;
             }
+            
             .prompt-item:hover {
               background: rgba(0, 59, 0, 0.3);
             }
+            
             .prompt-item.selected {
               background: ${matrixDarkGreen};
               text-shadow: 0 0 8px rgba(0, 255, 65, 0.5);
             }
+            
             .prompt-actions {
               display: flex;
               gap: 10px;
               flex-wrap: wrap;
             }
+            
             .prompt-preview-section {
               margin-top: 20px;
             }
+            
             .prompt-preview {
               background: rgba(0, 20, 0, 0.3);
               border: 1px solid ${matrixGreen};
@@ -946,81 +1287,45 @@ export class ModeManagerService {
               font-size: 12px;
             }
             
-            /* Help Section Styling */
+            /* Help Section */
             .help-section {
               color: ${matrixGreen};
               font-size: 14px;
               line-height: 1.5;
             }
+            
             .help-section h3 {
               font-size: 18px;
               margin-top: 0;
               margin-bottom: 16px;
               text-shadow: 0 0 8px rgba(0, 255, 65, 0.5);
             }
+            
             .help-section h4 {
               font-size: 16px;
               margin-top: 20px;
               margin-bottom: 10px;
               text-shadow: 0 0 5px rgba(0, 255, 65, 0.4);
             }
+            
             .help-section p {
               margin-bottom: 16px;
             }
+            
             .help-section ul {
               margin-bottom: 16px;
               padding-left: 20px;
             }
+            
             .help-section code {
               background: rgba(0, 59, 0, 0.3);
               padding: 2px 4px;
               border-radius: 3px;
               font-family: monospace;
             }
-            .prompt-selection {
-              margin-bottom: 15px;
-              display: flex;
-              align-items: center;
-              gap: 10px;
-            }
-
-            #prompt-select {
-              background: ${matrixBlack};
-              color: ${matrixGreen};
-              border: 1px solid ${matrixGreen};
-              border-radius: 4px;
-              padding: 8px;
-              appearance: none;
-              -webkit-appearance: none;
-              -moz-appearance: none;
-              background-image: url("data:image/svg+xml;utf8,<svg fill='%2300FF41' height='24' viewBox='0 0 24 24' width='24' xmlns='http://www.w3.org/2000/svg'><path d='M7 10l5 5 5-5z'/><path d='M0 0h24v24H0z' fill='none'/></svg>");
-              background-repeat: no-repeat;
-              background-position: right 8px center;
-              padding-right: 32px;
-              font-family: 'Courier New', monospace;
-              box-shadow: 0 0 8px rgba(0, 255, 65, 0.15);
-              width: 100%;
-              cursor: pointer;
-              transition: all 0.3s ease;
-            }
-
-            #prompt-select:hover {
-              box-shadow: 0 0 12px rgba(0, 255, 65, 0.3);
-            }
-
-            #prompt-select:focus {
-              outline: none;
-              box-shadow: 0 0 15px rgba(0, 255, 65, 0.4);
-            }
-
-            #prompt-select option {
-              background: ${matrixBlack};
-              color: ${matrixGreen};
-              padding: 8px;
-            }
           </style>
         </head>
-        <body>
+        <body class="${this.currentMode === 'vibe' ? 'vibe-mode' : 'code-mode'}">
           <div class="mode-toggle">
             <button class="mode-button ${this.currentMode === 'vibe' ? 'active' : ''}" 
                     id="vibe-mode-button">Vibe</button>
@@ -1060,12 +1365,14 @@ export class ModeManagerService {
                 <div class="container-label">COMPILED PROMPT</div>
                 <div id="prompt-output"></div>
               </div>
-              <div class="controls">
-                <button id="dictation-toggle">Start Dictation</button>
-                <span class="hotkey-hint">[⌘⇧D]</span>
-                <button id="settings-button" class="icon-button">⚙️</button>
               </div>
+              <!-- END WRAPPER -->
               <div class="section-overlay" id="code-overlay"></div>
+            </div>
+            <div class="controls">
+              <button id="dictation-toggle" class="code-only">Start Dictation</button>
+              <span class="hotkey-hint code-only">[⌘⇧D]</span>
+              <button id="settings-button" class="icon-button">⚙️</button>
             </div>
           </div>
 
@@ -1182,10 +1489,15 @@ export class ModeManagerService {
                 document.querySelectorAll('.mode-button').forEach(btn => {
                   btn.classList.toggle('active', btn.textContent.toLowerCase() === mode);
                 });
-                const vibeOverlay = document.getElementById('vibe-overlay');
-                const codeOverlay = document.getElementById('code-overlay');
-                vibeOverlay.classList.toggle('inactive', mode !== 'vibe');
-                codeOverlay.classList.toggle('inactive', mode !== 'code');
+                
+                // REMOVE OR COMMENT OUT THESE LINES - they're causing the blur/dimming
+                // const vibeOverlay = document.getElementById('vibe-overlay');
+                // const codeOverlay = document.getElementById('code-overlay');
+                // vibeOverlay.classList.toggle('inactive', mode !== 'vibe');
+                // codeOverlay.classList.toggle('inactive', mode !== 'code');
+                
+                // ADD THIS: Update body class for mode-specific styling
+                document.body.className = mode === 'vibe' ? 'vibe-mode' : 'code-mode';
               }
               
               function switchMode(mode) {
@@ -1270,7 +1582,7 @@ export class ModeManagerService {
               }
               
               function createPrompt() {
-                vscode.commands.executeCommand('vibe-coder.managePrompts')
+                vscode.postMessage({ type: 'createPrompt' });
                 closeSettings();
               }
               
@@ -1661,234 +1973,6 @@ export class ModeManagerService {
     `
   }
 
-  private setupMessageHandling() {
-    if (!this.panel) return
-    
-    this.refreshPrompts()
-    this.panel.webview.onDidReceiveMessage(async message => {
-      console.log('Received message:', message)
-      
-      // Handle other message types
-      switch (message.type) {
-        case 'error':
-          // Handle error messages from the webview
-          console.error('Webview error:', message.message)
-          vscode.window.showErrorMessage(message.message)
-          break
-        
-        case 'audioEnded':
-          // Handle audio playback ended event
-          console.log('Audio playback ended')
-          break
-        
-        case 'switchMode':
-          await this.setMode(message.mode as Mode)
-          break
-        
-        case 'toggleDictation':
-          await this.toggleDictation()
-          break
-        
-        case 'setPrompt':
-          await this.promptManager.setCurrentPrompt(message.id)
-          this.refreshPrompts()
-          break
-        
-        case 'getApiKeyStatus':
-          const hasDeepgramKey = !!(await this.context.secrets.get('deepgram.apiKey'))
-          const hasOpenAIKey = !!(await this.context.secrets.get('openai.apiKey'))
-          this.panel?.webview.postMessage({ 
-            type: 'apiKeyStatus', 
-            hasDeepgramKey,
-            hasOpenAIKey
-          })
-          break
-        
-        case 'saveApiKey':
-          if (message.service === 'deepgram') {
-            await this.context.secrets.store('deepgram.apiKey', message.key)
-            vscode.window.showInformationMessage('Deepgram API key saved')
-            // Reinitialize the service with the new key
-            try {
-              this.deepgramService.updateApiKey(message.key)
-            } catch (error) {
-              console.error('Failed to update Deepgram API key:', error)
-            }
-          } else if (message.service === 'openai') {
-            await this.context.secrets.store('openai.apiKey', message.key)
-            vscode.window.showInformationMessage('OpenAI API key saved')
-          }
-          break
-        
-        case 'clearApiKey':
-          if (message.service === 'deepgram') {
-            await this.context.secrets.delete('deepgram.apiKey')
-            vscode.window.showInformationMessage('Deepgram API key cleared')
-          } else if (message.service === 'openai') {
-            await this.context.secrets.delete('openai.apiKey')
-            vscode.window.showInformationMessage('OpenAI API key cleared')
-          }
-          break
-        
-        case 'getMicrophoneDevices':
-          // Update the approach for getting microphone devices
-          try {
-            // Get the configured device from settings
-            const micConfig = vscode.workspace.getConfiguration('vibeCoder.microphone')
-            const currentPlatform = process.platform
-            let configuredDevice = ''
-            
-            if (currentPlatform === 'darwin') {
-              configuredDevice = micConfig.get<string>('deviceMacOS') || ''
-            } else if (currentPlatform === 'win32') {
-              configuredDevice = micConfig.get<string>('deviceWindows') || ''
-            } else {
-              configuredDevice = micConfig.get<string>('deviceLinux') || ''
-            }
-            
-            // Provide a platform-specific default device list
-            let devices: string[] = ['default']
-            
-            // Add platform-specific devices
-            if (currentPlatform === 'darwin') {
-              // On macOS, add common built-in devices
-              devices = ['default', 'Built-in Microphone']
-              
-              // The system_profiler command is failing, so we'll use a different approach
-              // We'll simply provide generic options and let the user test them
-              devices.push('MacBook Pro Microphone', 'Headset Microphone')
-            } else if (currentPlatform === 'win32') {
-              devices.push('Microphone (Realtek Audio)', 'Headset Microphone')
-            } else {
-              // Linux devices
-              devices.push('plughw:0,0', 'plughw:1,0')
-            }
-            
-            // Send the device list to the webview
-            this.panel?.webview.postMessage({
-              type: 'microphoneDevices',
-              devices,
-              configuredDevice
-            })
-            
-            // Only try to execute the command if it's not on macOS (since it's failing there)
-            if (currentPlatform !== 'darwin') {
-              // Execute the command to list microphone devices in the output channel
-              vscode.commands.executeCommand('vibeCoder.listMicrophoneDevices')
-                .then(() => {}, (err: Error) => {
-                  console.error('Failed to list microphone devices:', err)
-                })
-            } else {
-              // For macOS, log a note about the workaround
-              console.log('Using default microphone device list for macOS')
-            }
-          } catch (error) {
-            console.error('Error getting microphone devices:', error)
-            this.panel?.webview.postMessage({
-              type: 'microphoneDevices',
-              devices: ['default'],
-              configuredDevice: ''
-            })
-          }
-          break
-        
-        case 'testMicrophone':
-          // Execute the command to test the microphone
-          vscode.commands.executeCommand('vibeCoder.testMicrophone')
-            .then(() => {
-              this.panel?.webview.postMessage({
-                type: 'microphoneTestResult',
-                success: true,
-                message: 'Microphone test successful! Audio is being captured correctly.'
-              })
-            }, (error: Error) => {
-              // Handle rejection using the second parameter of then() instead of catch()
-              this.panel?.webview.postMessage({
-                type: 'microphoneTestResult',
-                success: false,
-                message: 'Microphone test failed: ' + error.message
-              })
-            })
-          break
-        
-        case 'saveMicrophoneDevice':
-          // Save the selected device to settings
-          try {
-            const micConfig = vscode.workspace.getConfiguration('vibeCoder.microphone')
-            const currentPlatform = process.platform
-            
-            if (currentPlatform === 'darwin') {
-              await micConfig.update('deviceMacOS', message.device, vscode.ConfigurationTarget.Global)
-            } else if (currentPlatform === 'win32') {
-              await micConfig.update('deviceWindows', message.device, vscode.ConfigurationTarget.Global)
-            } else {
-              await micConfig.update('deviceLinux', message.device, vscode.ConfigurationTarget.Global)
-            }
-            
-            vscode.window.showInformationMessage('Microphone device settings saved')
-          } catch (error) {
-            console.error('Error saving microphone device:', error)
-            vscode.window.showErrorMessage('Failed to save microphone device settings')
-          }
-          break
-        
-        case 'getPromptsList':
-          const prompts = [
-            this.promptManager.getDefaultPrompt(),
-            ...this.promptManager.getAllPrompts()
-          ]
-          this.panel?.webview.postMessage({
-            type: 'promptsList',
-            prompts
-          })
-          break
-        
-        case 'getPromptPreview':
-          const prompt = message.id === 'default' 
-            ? this.promptManager.getDefaultPrompt() 
-            : this.promptManager.getPromptById(message.id)
-            
-          if (prompt) {
-            this.panel?.webview.postMessage({
-              type: 'promptPreview',
-              id: prompt.id,
-              prompt: prompt.prompt
-            })
-          }
-          break
-        
-        case 'createPrompt':
-          vscode.commands.executeCommand('vibe-coder.managePrompts')
-          break
-        
-        case 'editPrompt':
-          // We'll use the existing command but pass the ID
-          // This requires modifying the command handler to accept an ID
-          vscode.commands.executeCommand('vibe-coder.managePrompts', { action: 'edit', id: message.id })
-          break
-        
-        case 'deletePrompt':
-          await this.promptManager.deletePrompt(message.id)
-          // Refresh the prompts list
-          const updatedPrompts = [
-            this.promptManager.getDefaultPrompt(),
-            ...this.promptManager.getAllPrompts()
-          ]
-          this.panel?.webview.postMessage({
-            type: 'promptsList',
-            prompts: updatedPrompts
-          })
-          vscode.window.showInformationMessage('Prompt deleted successfully')
-          break
-        
-        case 'setDefaultPrompt':
-          await this.promptManager.setCurrentPrompt(message.id)
-          vscode.window.showInformationMessage('Prompt set as default')
-          break
-      }
-    })
-  }
-
   async setMode(mode: Mode) {
     console.log('Setting mode to:', mode)
     
@@ -1909,7 +1993,7 @@ export class ModeManagerService {
     }
 
     this.currentMode = mode
-    this.panel?.webview.postMessage({ type: 'updateMode', mode })
+    this.postMessage({ type: 'updateMode', mode })
   }
 
   show() {
@@ -1917,24 +2001,29 @@ export class ModeManagerService {
     if (!this.isInitialized) {
       throw new Error('Mode manager not initialized')
     }
-    if (!this.panel) {
-      this.createPanel()
+    
+    // Show the panel in the bottom area
+    vscode.commands.executeCommand('vibeCoder.panel.focus')
+    
+    // If the view provider is ready, show it
+    if (this.viewProvider) {
+      this.viewProvider.show(true)
     }
-    this.panel?.reveal()
   }
 
   private cleanup() {
     if (this.currentMode === 'vibe') {
       this.voiceAgentService.setAgentPanel(undefined)
       this.voiceAgentService.cleanup()
-    } else if (this.isDictationActive)
+    } else if (this.isDictationActive) {
       this.deepgramService.stopDictation()
-    this.panel = undefined
+    }
+    this.viewProvider = undefined
   }
 
   dispose() {
     this.cleanup()
-    this.panel?.dispose()
+    this.viewProvider?.dispose()
   }
 
   public async toggleDictation() {
@@ -1959,7 +2048,7 @@ export class ModeManagerService {
       console.log('Starting dictation in DeepgramService...')
       await this.deepgramService.startDictation()
       console.log('Dictation started successfully')
-      this.panel?.webview.postMessage({ 
+      this.postMessage({ 
         type: 'updateStatus', 
         text: 'Recording...',
         target: 'code-status'
@@ -1967,7 +2056,7 @@ export class ModeManagerService {
     } catch (error) {
       console.error('Failed to start dictation:', error)
       this.isDictationActive = false
-      this.panel?.webview.postMessage({ 
+      this.postMessage({ 
         type: 'updateStatus', 
         text: 'Error starting recording',
         target: 'code-status'
@@ -1983,12 +2072,12 @@ export class ModeManagerService {
       await this.deepgramService.stopDictation()
       const haveAnyTranscript = this.finalTranscripts.length > 0 || this.interimTranscript.trim()
       if (haveAnyTranscript) {
-        this.panel?.webview.postMessage({ 
+        this.postMessage({ 
           type: 'updateStatus', 
           text: 'Processing...',
           target: 'code-status'
         })
-        this.panel?.webview.postMessage({
+        this.postMessage({
           type: 'updateTranscript',
           text: '',
           target: 'prompt-output'
@@ -1999,7 +2088,7 @@ export class ModeManagerService {
           text: this.finalTranscripts.join(' ') + ' ' + this.interimTranscript,
           prompt: this.promptManager.getCurrentPrompt(),
           onToken: (token: string) => {
-            this.panel?.webview.postMessage({
+            this.postMessage({
               type: 'appendTranscript',
               text: token,
               target: 'prompt-output'
@@ -2010,7 +2099,7 @@ export class ModeManagerService {
           vscode.window.showErrorMessage(streamResponse.error)
         } else {
           await vscode.env.clipboard.writeText(streamResponse.text)
-          this.panel?.webview.postMessage({ type: 'showSuccess' })
+          this.postMessage({ type: 'showSuccess' })
         }
       }
     } catch (error) {
@@ -2018,7 +2107,7 @@ export class ModeManagerService {
     } finally {
       this.finalTranscripts = []
       this.interimTranscript = ''
-      this.panel?.webview.postMessage({ 
+      this.postMessage({ 
         type: 'updateStatus', 
         text: 'Ready',
         target: 'code-status'
@@ -2027,12 +2116,12 @@ export class ModeManagerService {
   }
 
   private refreshPrompts() {
-    if (!this.panel) return
-    this.panel.webview.postMessage({
+    if (!this.viewProvider) return
+    this.postMessage({
       type: 'populatePrompts',
       prompts: [this.promptManager.getDefaultPrompt(), ...this.promptManager.getAllPrompts()]
     })
-    this.panel.webview.postMessage({
+    this.postMessage({
       type: 'setCurrentPrompt',
       id: this.promptManager.getCurrentPrompt().id
     })

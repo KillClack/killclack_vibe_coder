@@ -32,6 +32,26 @@
   },
   "main": "./dist/extension.js",
   "contributes": {
+    "viewsContainers": {
+      "panel": [
+        {
+          "id": "vibeCoder",
+          "title": "Vibe Coder",
+          "icon": "vibe-coder-logo.png"
+        }
+      ]
+    },
+    "views": {
+      "vibeCoder": [
+        {
+          "type": "webview",
+          "icon": "vibe-coder-logo.png",
+          "id": "vibeCoder.panel",
+          "name": "Vibe Coder",
+          "visibility": "visible"
+        }
+      ]
+    },
     "commands": [
       {
         "command": "vibe-coder.test",
