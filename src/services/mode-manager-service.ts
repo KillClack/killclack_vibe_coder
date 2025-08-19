@@ -658,13 +658,15 @@ export class ModeManagerService {
             display: none;
           }
             body {
-              padding: 20px;
-              font-family: 'Courier New', monospace;
-              color: ${matrixGreen};
-              background-color: ${matrixBlack};
-              margin: 0;
-              min-height: 100vh;
-            }
+            padding: 20px;
+            font-family: 'Courier New', monospace;
+            color: ${matrixGreen};
+            background-color: ${matrixBlack};
+            margin: 0;
+            height: 100vh;  /* Use 100vh for body */
+            box-sizing: border-box;  /* Include padding in height calculation */
+            overflow: hidden;  /* Prevent body scrolling */
+          }
             
             /* Mode Toggle Button Styles */
             .mode-toggle {
@@ -705,7 +707,7 @@ export class ModeManagerService {
             /* Container Styles */
             .content-container {
               width: 100%;
-              height: calc(100vh - 100px);
+              height: calc(100% - 60px);
               display: flex;
               flex-direction: column;
               position: relative;
@@ -727,7 +729,7 @@ export class ModeManagerService {
               flex-direction: column;
               align-items: center;
               justify-content: center;
-              height: 100%;
+              height: 100%;  /* Already correct */
             }
             
             .vibe-mode .code-section {
